@@ -708,9 +708,9 @@
     <!-- Firebase SDKs -->
     <script type="module">
         import { initializeApp } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-app.js";
-        import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
+        import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged, setPersistence, browserSessionPersistence } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
         // Import collectionGroup added for Admin access
-        import { getFirestore, collection, collectionGroup, doc, setDoc, onSnapshot, serverTimestamp, writeBatch, getDocs, deleteDoc, updateDoc } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
+        import { getFirestore, collection, collectionGroup, doc, setDoc, onSnapshot, serverTimestamp, writeBatch, getDocs, deleteDoc, updateDoc, query, where } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // Konfigurasi Firebase Anda
         const firebaseConfig = {
@@ -722,9 +722,14 @@
             appId: "1:834050411409:web:5d89c9944337054b8fe830"
         };
 
-        const app = initializeApp(firebaseConfig);
+        // SOLUSI 1: Isolasi Sesi Login Admin
+        // Menambahkan nama "AdminApp" agar tidak bentrok dengan sesi login CS
+        const app = initializeApp(firebaseConfig, "AdminApp");
         const auth = getAuth(app);
         const db = getFirestore(app);
+
+        // Set agar sesi admin hanya bertahan selama tab browser aktif (opsional tapi disarankan untuk keamanan admin)
+        setPersistence(auth, browserSessionPersistence);
 
         // Global Variables
         let user = null;
@@ -845,10 +850,21 @@
         function setupDataListeners() {
             if (!user) return;
 
+            // Set default date range to BULAN INI agar data awal tidak terlalu berat
             if(!document.getElementById('dash-start-date').value) {
                 const today = new Date();
-                document.getElementById('dash-start-date').valueAsDate = today;
-                document.getElementById('dash-end-date').valueAsDate = today;
+                const firstDay = new Date(today.getFullYear(), today.getMonth(), 1);
+                
+                // Format YYYY-MM-DD untuk input date
+                const formatToYYYYMMDD = (d) => {
+                    let month = '' + (d.getMonth() + 1), day = '' + d.getDate(), year = d.getFullYear();
+                    if (month.length < 2) month = '0' + month;
+                    if (day.length < 2) day = '0' + day;
+                    return [year, month, day].join('-');
+                }
+
+                document.getElementById('dash-start-date').value = formatToYYYYMMDD(firstDay);
+                document.getElementById('dash-end-date').value = formatToYYYYMMDD(today);
             }
 
             // 1. Settings General Admin (untuk view Admin sendiri)
@@ -866,7 +882,9 @@
                     if(data.batasHariJenuh) batasHariJenuh = data.batasHariJenuh;
                     if(data.fontSize) {
                         document.documentElement.style.fontSize = data.fontSize + 'px';
-                        document.getElementById('set-font-size').value = data.fontSize;
+                        if (document.getElementById('set-font-size')) {
+                            document.getElementById('set-font-size').value = data.fontSize;
+                        }
                     }
                 }
                 
@@ -909,9 +927,34 @@
                 showToast("Rules Firestore mencegah akses global Admin. Hubungi Developer.", "error");
             });
 
-            // 3. Data Transaksi (Semua User)
+            // Panggil fungsi penarik data transaksi yang sudah dioptimasi
+            fetchTransactionsByDate();
+        }
+
+        // SOLUSI 2: Optimasi Penarikan Data Transaksi Berdasarkan Tanggal
+        window.fetchTransactionsByDate = function() {
+            if(!user) return;
+            
+            // Matikan listener lama jika ada (agar tidak bocor memori)
+            if(unsubTransactions) unsubTransactions();
+
+            const startDateInput = document.getElementById('dash-start-date').value;
+            const endDateInput = document.getElementById('dash-end-date').value;
+
+            if(!startDateInput || !endDateInput) return;
+
+            // Membuat query yang HANYA menarik data di rentang tanggal tersebut
             const transaksiGroupRef = collectionGroup(db, 'transactions');
-            unsubTransactions = onSnapshot(transaksiGroupRef, (snapshot) => {
+            const q = query(
+                transaksiGroupRef, 
+                where("tanggal", ">=", startDateInput),
+                where("tanggal", "<=", endDateInput)
+            );
+
+            // Tampilkan indikator loading di tombol (opsional)
+            showToast("Memuat data transaksi...", "success");
+
+            unsubTransactions = onSnapshot(q, (snapshot) => {
                 allTransactions = [];
                 uniqueCsList = [];
                 snapshot.forEach((doc) => {
@@ -926,9 +969,16 @@
                 });
                 window.renderTransaksiTable();
                 window.updateDashboardStats();
-            }, (error) => { console.error("Tx Error:", error); });
+            }, (error) => { 
+                console.error("Tx Error:", error); 
+                // Jika error index, Firebase akan memberikan URL di console untuk membuat index
+                if(error.message.includes("index")) {
+                    showToast("Harap buat Index Firestore (Cek Console Browser)", "error");
+                }
+            });
         }
 
+        // Modifikasi fungsi updateDashboardStats karena data sudah ter-filter dari server
         window.updateDashboardStats = function() {
             if(!user) return;
             
@@ -945,10 +995,8 @@
             const endStr = endDateInput ? new Date(endDateInput).toLocaleDateString('id-ID', {day:'2-digit', month:'short'}) : 'Akhir';
             document.getElementById('lbl-dash-time').textContent = `${startStr} - ${endStr}`;
 
-            let filteredTx = allTransactions.filter(tx => {
-                const txDate = new Date(tx.tanggal);
-                return txDate >= startDate && txDate <= endDate;
-            });
+            // TIDAK PERLU FILTER JS LAGI KARENA SUDAH DIFILTER OLEH SERVER FIREBASE
+            let filteredTx = allTransactions;
 
             let totalDonasi = 0, donasiIklan = 0, donasiCRM = 0;
             let countIklan = 0, countCRM = 0;
@@ -1195,6 +1243,14 @@
             window.filterDonatur();
         }
 
+        // Override fungsi onchange tanggal agar memanggil fetch ulang dari server
+        document.getElementById('dash-start-date').onchange = function() {
+            window.fetchTransactionsByDate();
+        };
+        document.getElementById('dash-end-date').onchange = function() {
+            window.fetchTransactionsByDate();
+        };
+
         // Render Table Data (Global Admin)
         window.renderDonaturTable = function() {
             const tbody = document.getElementById('table-donatur-body');
@@ -1382,7 +1438,6 @@
         }
 
         // Simpan Form Pengaturan
-        document.getElementById('form-tampilan').addEventListener('submit', async (e) => { /* Tidak Relevan di Admin */ e.preventDefault(); });
         document.getElementById('form-kategori').addEventListener('submit', async (e) => {
             e.preventDefault(); const btn = e.target.querySelector('button'); btn.disabled = true;
             try {
